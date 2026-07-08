@@ -1,0 +1,14 @@
+# Runtime/local configuration
+config.json
+MDT_Downloads/
+*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local/legacy material with hardcoded credentials and operational site lists
+TransferMDT/
+
+# Local copied reference docs can be regenerated from AMDrive_Amdocs
+docs_from_amdrive/
