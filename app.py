@@ -362,14 +362,22 @@ INDEX_HTML = r"""
   <title>ENM MDT Scheduler</title>
   <style>
     :root {
-      --bg: #0b1628;
-      --panel: #101e34;
-      --panel-2: #14233d;
-      --line: #31435f;
-      --text: #f8fafc;
+      --bg: #0f1b33;
+      --panel: #0f1b33;
+      --table: #101a2e;
+      --table-alt: #15213a;
+      --header: #1a2947;
+      --line: #60708d;
+      --grid: #2d3a55;
+      --text: #e7edf8;
+      --title: #d7e2f2;
       --muted: #a8b3c7;
-      --input: #f3f6fb;
-      --selected: #294572;
+      --input: #f4f7fb;
+      --input-disabled: #dbe2ec;
+      --input-text: #081426;
+      --selected: #243b63;
+      --hover: #e5edf9;
+      --accent: #2f6fed;
       --green: #68d391;
       --red: #ff7b7b;
       --orange: #f6ad55;
@@ -387,36 +395,62 @@ INDEX_HTML = r"""
     fieldset {
       border: 1px solid var(--line);
       border-radius: 4px;
-      padding: 12px;
+      padding: 14px 12px 12px;
       margin: 0 0 12px;
       background: var(--panel);
+      font-weight: 700;
     }
-    legend { padding: 0 8px; font-weight: 700; }
+    legend { padding: 0 4px; font-weight: 700; color: var(--title); }
     label { font-weight: 700; }
     input, select, button {
       font: inherit;
-      border-radius: 4px;
-      border: 1px solid #9fb0c9;
-      padding: 6px 8px;
+      border-radius: 3px;
+      border: 1px solid #a9b4c6;
+      padding: 5px 8px;
     }
-    input, select { background: var(--input); color: #111827; }
+    input, select {
+      background: var(--input);
+      color: var(--input-text);
+      font-weight: 400;
+    }
+    input:disabled, select:disabled {
+      background: var(--input-disabled);
+      color: #4b5568;
+    }
+    input::selection {
+      background: var(--accent);
+      color: #ffffff;
+    }
     button {
       cursor: pointer;
-      background: #f3f6fb;
-      color: #020617;
-      font-weight: 700;
+      background: var(--input);
+      color: var(--input-text);
+      font-weight: 600;
       min-width: 86px;
+      border-radius: 4px;
+      padding: 6px 14px;
     }
-    button:disabled { opacity: .55; cursor: default; }
+    button:hover { background: var(--hover); }
+    button:disabled {
+      background: var(--input-disabled);
+      color: #718096;
+      cursor: default;
+    }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .grow { flex: 1 1 220px; }
     .short { width: 78px; }
     .medium { width: 160px; }
     .long { width: min(100%, 680px); }
     table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-    th, td { border: 1px solid var(--line); padding: 10px 8px; text-align: left; }
-    th { background: #1a2b48; }
-    tr { background: #0f1b2d; }
+    th, td { border: 1px solid var(--grid); padding: 10px 8px; text-align: left; }
+    th {
+      background: var(--header);
+      color: var(--title);
+      border-color: var(--grid);
+      font-weight: 700;
+    }
+    tr { background: var(--table); }
+    tr:nth-child(even) { background: var(--table-alt); }
     tr.selected { background: var(--selected); }
     td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .status-running { color: var(--orange); font-weight: 800; }
@@ -430,7 +464,7 @@ INDEX_HTML = r"""
       margin: 8px 0 0;
       padding: 10px;
       background: #071120;
-      color: #d7e2f2;
+      color: var(--title);
       border: 1px solid var(--line);
       font-family: Consolas, monospace;
       font-size: 13px;
