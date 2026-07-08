@@ -17,7 +17,13 @@ does not require a fixed `sites.txt`. It downloads only new `*.bin.gz` and
 Run:
 
 ```powershell
-python app.py
+C:\CRT\.venv\Scripts\python.exe app.py
+```
+
+Or use:
+
+```powershell
+.\run_scheduler.bat
 ```
 
 Open:
@@ -26,9 +32,9 @@ Open:
 http://127.0.0.1:8095
 ```
 
-The UI follows the ENM Manager scheduler model: multiple jobs, Start/Stop,
-Run Now, Edit/Delete, time windows, progress logs and a dedicated `MDT Transfer`
-job type. It imports saved ENM sessions from `%USERPROFILE%\.securecrt_manager`
+The UI follows the web scheduler style from `C:/MoB_Tool_Box`: compact job rows,
+inline actions, time windows, progress logs and a dedicated `MDT Transfer` job
+type. It imports saved ENM sessions from `%USERPROFILE%\.securecrt_manager`
 when available. Passwords are kept only in memory.
 
 For scheduler testing, enable `Dry run (scan only)` and set `Test sec` to a

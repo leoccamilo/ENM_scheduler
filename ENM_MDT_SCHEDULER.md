@@ -42,10 +42,13 @@ download timestamp. This is what prevents repeated downloads.
 ## Run
 
 ```powershell
-python app.py
+C:\CRT\.venv\Scripts\python.exe app.py
 ```
 
 Open `http://127.0.0.1:8095`.
+
+Use the Python 3.9 virtual environment from ENM Manager. This keeps scheduled
+Python scripts on the same runtime expected by ENM scripting.
 
 The app imports ENM sessions from `%USERPROFILE%\.securecrt_manager\sessions.db`
 when available, so the same ENMs created in ENM Manager appear in the scheduler.
