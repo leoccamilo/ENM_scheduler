@@ -20,4 +20,8 @@ Run:
 python app.py
 ```
 
+For scheduler testing, enable `Dry run (scan only)` and set `Test sec` to a
+small value such as `30`. For production scheduling, leave `Test sec` as `0`
+and use `Every min` with the desired interval.
+
 More details: [ENM_MDT_SCHEDULER.md](ENM_MDT_SCHEDULER.md).

@@ -5,7 +5,6 @@ import queue
 import threading
 import time
 import tkinter as tk
-from dataclasses import asdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -26,9 +25,11 @@ DEFAULT_CONFIG = {
     "username": "",
     "local_base": str(APP_DIR / "MDT_Downloads"),
     "interval_minutes": 60,
+    "interval_seconds": 0,
     "initial_lookback_minutes": 90,
     "grace_minutes": 30,
     "max_parallel_downloads": 2,
+    "dry_run": False,
     "remote_bases": [
         "/ericsson/pmic1/CELLTRACE",
         "/ericsson/pmic2/CELLTRACE",
@@ -51,6 +52,7 @@ class SchedulerApp(tk.Tk):
         self.running_now = False
 
         self.vars: dict[str, tk.StringVar] = {}
+        self.dry_run_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Stopped")
         self.next_run_var = tk.StringVar(value="-")
 
@@ -78,9 +80,13 @@ class SchedulerApp(tk.Tk):
             row=0, column=2, padx=6, pady=6
         )
         self._entry(settings, "Every min", "interval_minutes", 1, width=8)
-        self._entry(settings, "First lookback min", "initial_lookback_minutes", 1, column=2, width=8)
-        self._entry(settings, "Grace min", "grace_minutes", 1, column=4, width=8)
-        self._entry(settings, "Parallel", "max_parallel_downloads", 1, column=6, width=8)
+        self._entry(settings, "Test sec", "interval_seconds", 1, column=2, width=8)
+        self._entry(settings, "First lookback min", "initial_lookback_minutes", 1, column=4, width=8)
+        self._entry(settings, "Grace min", "grace_minutes", 1, column=6, width=8)
+        self._entry(settings, "Parallel", "max_parallel_downloads", 2, width=8)
+        ttk.Checkbutton(settings, text="Dry run (scan only)", variable=self.dry_run_var).grid(
+            row=2, column=2, columnspan=2, padx=(8, 4), pady=6, sticky="w"
+        )
 
         remote_frame = ttk.LabelFrame(root, text="Remote CELLTRACE bases")
         remote_frame.pack(fill=tk.X, pady=(10, 0))
@@ -141,6 +147,8 @@ class SchedulerApp(tk.Tk):
         for key, value in data.items():
             if key == "remote_bases":
                 self.vars[key].set(";".join(str(item) for item in value))
+            elif key == "dry_run":
+                self.dry_run_var.set(bool(value))
             else:
                 self.vars.setdefault(key, tk.StringVar()).set(str(value))
         self.vars.setdefault("password", tk.StringVar()).set("")
@@ -160,6 +168,7 @@ class SchedulerApp(tk.Tk):
             "username": self.vars["username"].get().strip(),
             "local_base": self.vars["local_base"].get().strip(),
             "interval_minutes": int(self.vars["interval_minutes"].get().strip() or "60"),
+            "interval_seconds": int(self.vars["interval_seconds"].get().strip() or "0"),
             "initial_lookback_minutes": int(
                 self.vars["initial_lookback_minutes"].get().strip() or "90"
             ),
@@ -172,6 +181,7 @@ class SchedulerApp(tk.Tk):
                 for item in self.vars["remote_bases"].get().replace("\n", ";").split(";")
                 if item.strip()
             ],
+            "dry_run": bool(self.dry_run_var.get()),
         }
         if include_password:
             data["password"] = self.vars["password"].get()
@@ -194,7 +204,15 @@ class SchedulerApp(tk.Tk):
             initial_lookback_minutes=data["initial_lookback_minutes"],
             grace_minutes=data["grace_minutes"],
             max_parallel_downloads=data["max_parallel_downloads"],
+            dry_run=data["dry_run"],
         )
+
+    def _effective_interval_seconds(self) -> int:
+        data = self._config_dict(include_password=False)
+        test_seconds = int(data.get("interval_seconds") or 0)
+        if test_seconds > 0:
+            return test_seconds
+        return int(data["interval_minutes"]) * 60
 
     def _browse_local_base(self) -> None:
         start = self.vars["local_base"].get().strip() or str(APP_DIR)
@@ -206,17 +224,22 @@ class SchedulerApp(tk.Tk):
         if self.running_now:
             messagebox.showinfo("Run", "A collection is already running.")
             return
-        thread = threading.Thread(target=self._run_once_worker, daemon=True)
+        try:
+            config = self._collector_config()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Run", str(exc))
+            return
+        thread = threading.Thread(target=self._run_once_worker, args=(config,), daemon=True)
         thread.start()
 
-    def _run_once_worker(self) -> None:
+    def _run_once_worker(self, config: CollectionConfig) -> None:
         with self.worker_lock:
             self.running_now = True
             self._set_status("Running")
             try:
-                config = self._collector_config()
                 collector = EnmMdtCollector(config, log=self._log)
-                self._log("[run] Starting collection")
+                mode = "dry-run" if config.dry_run else "download"
+                self._log(f"[run] Starting collection ({mode})")
                 result = collector.collect_once()
                 self._log(
                     "[run] Finished: "
@@ -238,15 +261,19 @@ class SchedulerApp(tk.Tk):
             messagebox.showinfo("Scheduler", "Scheduler is already running.")
             return
         try:
-            interval = int(self.vars["interval_minutes"].get().strip() or "60")
-            if interval < 1:
-                raise ValueError("Interval must be at least 1 minute.")
-            self._collector_config()
+            config = self._collector_config()
+            interval_s = self._effective_interval_seconds()
+            if interval_s < 1:
+                raise ValueError("Interval must be at least 1 second.")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Scheduler", str(exc))
             return
         self.stop_event.clear()
-        self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
+        self.scheduler_thread = threading.Thread(
+            target=self._scheduler_loop,
+            args=(config, interval_s),
+            daemon=True,
+        )
         self.scheduler_thread.start()
         self._set_status("Scheduled")
         self._log("[scheduler] Started")
@@ -257,12 +284,11 @@ class SchedulerApp(tk.Tk):
         self._set_next_run("-")
         self._log("[scheduler] Stop requested")
 
-    def _scheduler_loop(self) -> None:
+    def _scheduler_loop(self, config: CollectionConfig, interval_s: int) -> None:
         while not self.stop_event.is_set():
-            self._run_once_worker()
+            self._run_once_worker(config)
             if self.stop_event.is_set():
                 break
-            interval_s = int(self.vars["interval_minutes"].get().strip() or "60") * 60
             next_epoch = time.time() + interval_s
             self._set_next_run(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_epoch)))
             self._set_status("Scheduled")

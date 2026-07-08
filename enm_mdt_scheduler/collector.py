@@ -109,6 +109,7 @@ class CollectionConfig:
     initial_lookback_minutes: int = 90
     grace_minutes: int = 30
     max_parallel_downloads: int = 2
+    dry_run: bool = False
 
     def state_path(self) -> Path:
         return Path(self.local_base) / "_state" / "downloaded_files.json"
@@ -272,6 +273,10 @@ class EnmMdtCollector:
 
         if not tasks:
             self._emit("[download] No new files to download")
+        elif self.config.dry_run:
+            self._emit(f"[dry-run] Would download {len(tasks)} new file(s)")
+            for item, local_path in tasks:
+                self._emit(f"[dry-run] {item.remote_path} -> {local_path}")
         else:
             self._emit(f"[download] Downloading {len(tasks)} new file(s)")
             workers = max(1, int(self.config.max_parallel_downloads))
@@ -301,8 +306,10 @@ class EnmMdtCollector:
                     )
                     self._emit(f"[download] OK {item.site}: {item.filename}")
 
-        state.last_scan_epoch = scan_started
-        state.save(state_path)
-        self._emit(f"[state] Saved {state_path}")
+        if self.config.dry_run:
+            self._emit("[dry-run] State not saved")
+        else:
+            state.last_scan_epoch = scan_started
+            state.save(state_path)
+            self._emit(f"[state] Saved {state_path}")
         return result
-

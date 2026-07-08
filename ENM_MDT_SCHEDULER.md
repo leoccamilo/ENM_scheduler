@@ -48,3 +48,12 @@ python app.py
 Enter ENM host, port, user, password and local base folder. The password is not
 saved to `config.json`.
 
+## Scheduler Test
+
+Use `Dry run (scan only)` while validating the schedule. In this mode the app
+connects, scans CELLTRACE and reports what it would download, but it does not
+transfer files and does not update `_state/downloaded_files.json`.
+
+Use `Test sec` to run the scheduler in seconds during validation. When
+`Test sec` is greater than `0`, it overrides `Every min`. For the real hourly
+job, set `Test sec` back to `0` and use `Every min = 60`.
