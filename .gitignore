@@ -8,6 +8,12 @@ MDT_Downloads/
 __pycache__/
 *.py[cod]
 
+# Ambiente virtual local do projeto
+.venv/
+
+# Snapshots/artefatos zipados
+*.zip
+
 # Local/legacy material with hardcoded credentials and operational site lists
 TransferMDT/
 
