@@ -1,5 +1,6 @@
 # Runtime/local configuration
 config.json
+schedules.json
 MDT_Downloads/
 *.log
 

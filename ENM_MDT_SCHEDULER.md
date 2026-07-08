@@ -1,6 +1,6 @@
 # ENM MDT Scheduler
 
-Standalone scheduler for Ericsson ENM MDT/CellTrace log downloads.
+Standalone local web scheduler for Ericsson ENM MDT/CellTrace log downloads.
 
 The company manual script in `TransferMDT/transfer_mdt_v2.py` downloads from:
 
@@ -45,8 +45,19 @@ download timestamp. This is what prevents repeated downloads.
 python app.py
 ```
 
-Enter ENM host, port, user, password and local base folder. The password is not
-saved to `config.json`.
+Open `http://127.0.0.1:8095`.
+
+The app imports ENM sessions from `%USERPROFILE%\.securecrt_manager\sessions.db`
+when available, so the same ENMs created in ENM Manager appear in the scheduler.
+Host, port, username and timeout can be edited. Passwords are accepted in the
+session panel but are kept only in memory and are not saved to `config.json`.
+
+Schedules are saved locally in `schedules.json` and can run more than one job.
+The current job types are:
+
+- `MDT Transfer`: downloads new CELLTRACE MDT files.
+- `Script (.py)`: runs a local Python script with optional ENM session
+  environment variables.
 
 ## Scheduler Test
 

@@ -1,6 +1,6 @@
 # ENM Scheduler
 
-Standalone scheduler for downloading Ericsson ENM MDT/CellTrace logs.
+Standalone local web scheduler for downloading Ericsson ENM MDT/CellTrace logs.
 
 The first version follows the company manual collector strategy for remote
 paths:
@@ -19,6 +19,17 @@ Run:
 ```powershell
 python app.py
 ```
+
+Open:
+
+```text
+http://127.0.0.1:8095
+```
+
+The UI follows the ENM Manager scheduler model: multiple jobs, Start/Stop,
+Run Now, Edit/Delete, time windows, progress logs and a dedicated `MDT Transfer`
+job type. It imports saved ENM sessions from `%USERPROFILE%\.securecrt_manager`
+when available. Passwords are kept only in memory.
 
 For scheduler testing, enable `Dry run (scan only)` and set `Test sec` to a
 small value such as `30`. For production scheduling, leave `Test sec` as `0`
