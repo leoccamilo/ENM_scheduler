@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from .collector import CollectionConfig, EnmMdtCollector, SshConfig
+from .collector import CollectionCancelled, CollectionConfig, EnmMdtCollector, SshConfig
 from .models import EnmSession, ScheduledJob
 
 
@@ -135,9 +135,21 @@ class SchedulerService:
             if not job or job.get("status") != "running":
                 return False, "No run in progress for this schedule."
             process = job.get("process")
+            collector = job.get("collector")
+            cancel_event = job.get("cancel_event")
             job["cancel_requested"] = True
+            if isinstance(cancel_event, threading.Event):
+                cancel_event.set()
+        if collector is not None:
+            try:
+                collector.cancel()
+            except Exception:
+                pass
+            self._append_job_lines(job_id, ["[cancel] MDT Transfer cancellation requested."])
+            return True, "MDT Transfer cancellation requested."
         if process is None:
-            return False, "This job type cannot be interrupted safely yet."
+            self._append_job_lines(job_id, ["[cancel] Cancellation requested."])
+            return True, "Cancellation requested."
         try:
             process.terminate()
             self._append_job_lines(job_id, ["[cancel] Process termination requested."])
@@ -249,9 +261,13 @@ class SchedulerService:
                 self.on_changed()
                 return
             if self.is_schedule_running(schedule):
-                schedule.last_error = (
-                    f"cycle {datetime.now().strftime('%H:%M:%S')} skipped: "
-                    "previous execution is still running"
+                skipped_at = datetime.now().strftime("%H:%M:%S")
+                self._append_job_lines(
+                    schedule.last_job_id,
+                    [
+                        f"[schedule] Cycle {skipped_at} skipped because "
+                        "the previous execution is still running."
+                    ],
                 )
                 schedule.next_run = self._format_dt(self._compute_next_run(schedule))
                 self._save_schedules_locked()
@@ -274,6 +290,8 @@ class SchedulerService:
             "lines": [],
             "schedule_id": schedule.id,
             "cancel_requested": False,
+            "cancel_event": threading.Event(),
+            "collector": None,
             "process": None,
         }
         schedule.last_run = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -297,9 +315,14 @@ class SchedulerService:
         schedule: ScheduledJob,
         session: EnmSession | None,
     ) -> None:
+        collector = None
         try:
             if session is None:
                 raise ValueError("Select an ENM session for MDT Transfer.")
+            with self._lock:
+                cancel_event = self.jobs.get(job_id, {}).get("cancel_event")
+            if not isinstance(cancel_event, threading.Event):
+                cancel_event = threading.Event()
             missing = [
                 field
                 for field, value in (
@@ -323,23 +346,39 @@ class SchedulerService:
                 ),
                 local_base=schedule.mdt.local_base,
                 remote_bases=tuple(schedule.mdt.remote_bases),
+                sites=tuple(schedule.mdt.sites),
                 initial_lookback_minutes=schedule.mdt.initial_lookback_minutes,
                 grace_minutes=schedule.mdt.grace_minutes,
                 max_parallel_downloads=schedule.mdt.max_parallel_downloads,
+                retry_attempts=schedule.mdt.retry_attempts,
+                retry_delay_seconds=schedule.mdt.retry_delay_seconds,
                 dry_run=schedule.mdt.dry_run,
             )
             mode = "dry-run" if cfg.dry_run else "download"
+            site_info = (
+                f"{len(cfg.sites)} site(s) from job list" if cfg.sites else "all discovered sites"
+            )
             self._append_job_lines(
                 job_id,
                 [
                     f"[mdt] Starting MDT Transfer ({mode})",
                     f"[mdt] Session {session.name} {session.username}@{session.host}:{session.port}",
+                    f"[mdt] Scope: {site_info}",
+                    f"[mdt] Retry: {cfg.retry_attempts} attempt(s), {cfg.retry_delay_seconds}s delay",
                 ],
             )
-            result = EnmMdtCollector(
+            collector = EnmMdtCollector(
                 cfg,
                 log=lambda line: self._append_job_lines(job_id, [line]),
-            ).collect_once()
+                cancel_requested=cancel_event.is_set,
+            )
+            with self._lock:
+                job = self.jobs.get(job_id)
+                if job:
+                    job["collector"] = collector
+            result = collector.collect_once()
+            if self._job_cancel_requested(job_id):
+                raise CollectionCancelled("MDT Transfer cancelled")
             self._append_job_lines(
                 job_id,
                 [
@@ -353,12 +392,21 @@ class SchedulerService:
                 ],
             )
             self._set_job_status(job_id, "done" if result.failed == 0 else "error")
+        except CollectionCancelled:
+            self._append_job_lines(job_id, ["[cancel] MDT Transfer cancelled."])
+            self._set_job_status(job_id, "cancelled")
         except Exception as exc:  # noqa: BLE001
             self._append_job_lines(
                 job_id,
                 [f"[ERROR] {exc}", *traceback.format_exc().splitlines()],
             )
             self._set_job_status(job_id, "error")
+        finally:
+            if collector is not None:
+                with self._lock:
+                    job = self.jobs.get(job_id)
+                    if job and job.get("collector") is collector:
+                        job["collector"] = None
 
     def _run_python(
         self,

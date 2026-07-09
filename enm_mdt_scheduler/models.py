@@ -43,13 +43,26 @@ class EnmSession:
         )
 
 
+def _parse_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        parts = value.replace("\n", ";").replace(",", ";").split(";")
+    else:
+        parts = list(value)
+    return [str(item).strip() for item in parts if str(item).strip()]
+
+
 @dataclass
 class MdtTransferSettings:
     local_base: str = DEFAULT_LOCAL_BASE
     remote_bases: list[str] = field(default_factory=lambda: list(DEFAULT_REMOTE_BASES))
+    sites: list[str] = field(default_factory=list)
     initial_lookback_minutes: int = 90
     grace_minutes: int = 30
     max_parallel_downloads: int = 2
+    retry_attempts: int = 5
+    retry_delay_seconds: int = 20
     dry_run: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -68,9 +81,12 @@ class MdtTransferSettings:
         return MdtTransferSettings(
             local_base=str(raw.get("local_base") or DEFAULT_LOCAL_BASE),
             remote_bases=[str(item).rstrip("/") for item in remote_bases if str(item).strip()],
+            sites=_parse_list(raw.get("sites")),
             initial_lookback_minutes=int(raw.get("initial_lookback_minutes") or 90),
             grace_minutes=int(raw.get("grace_minutes") or 30),
             max_parallel_downloads=int(raw.get("max_parallel_downloads") or 2),
+            retry_attempts=max(1, int(raw.get("retry_attempts") or 5)),
+            retry_delay_seconds=max(0, int(raw.get("retry_delay_seconds") or 20)),
             dry_run=bool(raw.get("dry_run", True)),
         )
 

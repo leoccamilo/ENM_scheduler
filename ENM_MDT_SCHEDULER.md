@@ -9,9 +9,15 @@ The company manual script in `TransferMDT/transfer_mdt_v2.py` downloads from:
 /ericsson/pmic2/CELLTRACE/
 ```
 
-This tool keeps the same remote bases, but does not require a `sites.txt`.
-It discovers all `MeContext`/`ManagedElement` folders under both CELLTRACE
-directories and downloads only new `*.bin.gz` and `*.gpb.gz` files.
+This tool keeps the same remote bases. Site scope is configurable per job:
+
+- **Collect all**: discovers every `MeContext`/`ManagedElement` folder under
+  both CELLTRACE directories (no `sites.txt` needed).
+- **From site list**: restricts the run to the sites registered in the job,
+  matching by site name (case-insensitive). The list can be typed or loaded
+  from a `.txt` using any separator (comma, semicolon or one per line).
+
+It downloads only new `*.bin.gz` and `*.gpb.gz` files.
 
 ## Local Layout
 
@@ -50,17 +56,54 @@ Open `http://127.0.0.1:8095`.
 Use the Python 3.9 virtual environment from ENM Manager. This keeps scheduled
 Python scripts on the same runtime expected by ENM scripting.
 
-The app imports ENM sessions from `%USERPROFILE%\.securecrt_manager\sessions.db`
-when available, so the same ENMs created in ENM Manager appear in the scheduler.
-Host, port, username and timeout can be edited. Passwords are accepted in the
-session panel but are kept only in memory and are not saved to `config.json`.
+ENM sessions are self-contained in `config.json` and fully managed in the
+**Manage sessions** tab: add, edit (name, host/IP, port, user, password,
+timeout) and remove connections. The connection `id` stays stable when you
+rename, so existing schedules keep pointing to the right session. Passwords are
+not saved to `config.json`; they are stored in `.enm_credentials.json` encrypted
+with Windows DPAPI for the current Windows user.
 
 Schedules are saved locally in `schedules.json` and can run more than one job.
 The current job types are:
 
-- `MDT Transfer`: downloads new CELLTRACE MDT files.
+- `MDT Transfer`: downloads new CELLTRACE MDT files (read-only SFTP).
 - `Script (.py)`: runs a local Python script with optional ENM session
   environment variables.
+
+## Cancellation and retry
+
+`Stop schedule` disables future executions. It does not interrupt a run that is
+already active. `Stop run` requests cancellation of the active job. For MDT
+Transfer this passes a cancellation signal into the collector, cancels queued
+download futures and closes active SSH/SFTP handles so a blocking `sftp.get()`
+can fail and unwind. Cancelled runs are marked as `cancelled`; partial `.part`
+files are removed by the downloader cleanup path.
+
+MDT Transfer retries transient SSH/SFTP/network failures during scan and per-file
+download. Authentication/configuration errors are not retried. Retry attempts
+and delay are configured per schedule through `Retries` and `Retry delay sec`.
+Progress logs include retry messages such as connection lost, retrying,
+reconnected and resuming.
+
+If a schedule is due while its previous execution is still running, the due
+cycle is skipped and written to the active job log. This is not treated as a
+schedule error, and no second run is started for the same schedule.
+
+When some downloads succeed but others fail, the state file is still saved with
+the successful records. The scan checkpoint is not advanced to the full cycle
+start time; instead, the next scan resumes from the oldest failed file, including
+the configured grace window. This avoids losing files after retry exhaustion
+while still preventing duplicates for completed files.
+
+## Command safety
+
+Any job type that sends commands to the ENM must route them through
+`enm_mdt_scheduler/security.py` (`assert_command_safe`). Commands that delete
+elements (`del`, `rm`, `rdel`, `deletemo`, `cmedit delete`, ...) or that can
+harm the OS/ENM management plane (`shutdown`, `mkfs`, `dd if=`, fork bombs, ...)
+are rejected before execution. `MDT Transfer` never runs remote commands, so it
+is unaffected; the guard is enforced on schedule creation for command-bearing
+job types.
 
 ## Scheduler Test
 

@@ -10,17 +10,43 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from enm_mdt_scheduler.models import EnmSession, MdtTransferSettings, ScheduledJob
 from enm_mdt_scheduler.scheduler_service import SchedulerService
-from enm_mdt_scheduler.sessions import fallback_sessions, load_manager_sessions, merge_sessions
+from enm_mdt_scheduler.security import assert_command_safe
+from enm_mdt_scheduler.secure_store import SecureStore
+from enm_mdt_scheduler.sessions import fallback_sessions, merge_sessions
 
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 SCHEDULES_PATH = APP_DIR / "schedules.json"
+CREDENTIALS_PATH = APP_DIR / ".enm_credentials.json"
+COLLECTOR_SOURCE = APP_DIR / "enm_mdt_scheduler" / "collector.py"
+LOGO_PATH = APP_DIR / "static" / "amdocs_logo.png"
+MAX_PREVIEW_BYTES = 500_000
 DEFAULT_PORT = 8095
+secure_store = SecureStore(CREDENTIALS_PATH)
+
+MDT_PREVIEW_SUMMARY = (
+    "MDT Transfer (built-in logic). What this job does on each cycle:\n"
+    "  1. Connects to the selected ENM session over SFTP.\n"
+    "  2. Lists the CELLTRACE bases and auto-discovers sites\n"
+    "     (MeContext=<site> / ManagedElement=<site> folders).\n"
+    "     - 'Collect all': processes every discovered site.\n"
+    "     - 'From site list': processes only the sites registered in this job\n"
+    "       (case-insensitive site-name comparison).\n"
+    "  3. Selects only *.bin.gz and *.gpb.gz files modified inside the scan\n"
+    "     window (first cycle = 'First lookback min'; later cycles = since the\n"
+    "     previous scan minus 'Grace min').\n"
+    "  4. Skips files already downloaded according to _state/downloaded_files.json.\n"
+    "  5. Downloads new files to <Local base>/DDMMYYYY/<site>/.\n"
+    "     In 'Dry run', it only lists what it would download and does not\n"
+    "     transfer files or save state.\n\n"
+    "Actual source code (enm_mdt_scheduler/collector.py):\n"
+    + "=" * 78 + "\n"
+)
 
 TYPE_LABELS = {
     "mdt_transfer": "MDT Transfer",
@@ -46,13 +72,23 @@ def save_config(payload: dict[str, Any]) -> None:
 
 def load_sessions() -> list[EnmSession]:
     config = load_config()
-    imported = load_manager_sessions() or fallback_sessions()
     saved = [
         EnmSession.from_dict(item)
         for item in config.get("sessions", [])
         if isinstance(item, dict)
     ]
-    return merge_sessions(imported, saved)
+    # Sessions are fully self-contained in config.json. On a brand-new install
+    # (no saved sessions yet) seed the default ENM connection names once so the
+    # user has something to edit; afterwards their saved list is authoritative.
+    if saved:
+        loaded = sorted(saved, key=lambda item: item.name.lower())
+    else:
+        loaded = merge_sessions(fallback_sessions(), [])
+
+    saved_passwords = secure_store.load_passwords()
+    for session in loaded:
+        session.password = saved_passwords.get(session.id, session.password)
+    return loaded
 
 
 sessions: list[EnmSession] = load_sessions()
@@ -69,12 +105,15 @@ def save_sessions() -> None:
     config = load_config()
     config["sessions"] = [session.to_dict(include_password=False) for session in sessions]
     save_config(config)
+    secure_store.save_passwords(
+        {session.id: session.password for session in sessions if session.password}
+    )
 
 
 def schedule_status(schedule: ScheduledJob) -> tuple[str, str]:
     if scheduler.is_schedule_running(schedule):
         return "running", "running"
-    if schedule.last_error:
+    if schedule.last_error and schedule.last_error != "cancelled":
         return "error", "error"
     if schedule.enabled:
         return "active", "active"
@@ -147,6 +186,40 @@ def session_to_api(session: EnmSession) -> dict[str, Any]:
     }
 
 
+def _parse_site_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        parts = value.replace("\n", ";").replace(",", ";").split(";")
+    else:
+        parts = list(value)
+    seen: dict[str, None] = {}
+    for item in parts:
+        name = str(item).strip()
+        if name:
+            seen.setdefault(name, None)
+    return list(seen.keys())
+
+
+def _reject_unsafe_commands(payload: dict[str, Any]) -> None:
+    """Block any remote-command field that could harm the ENM management plane.
+
+    Enforced defensively for current and future command-bearing job types
+    (CLI, amosbatch, egrep). MDT Transfer carries no command fields, so this is
+    a no-op for it.
+    """
+    command_keys = ("command", "cli_command", "amosbatch_command", "egrep_commands")
+    scopes = [payload]
+    nested = payload.get("amosbatch") or payload.get("cli")
+    if isinstance(nested, dict):
+        scopes.append(nested)
+    for scope in scopes:
+        for key in command_keys:
+            value = scope.get(key)
+            if isinstance(value, str) and value.strip():
+                assert_command_safe(value)
+
+
 def schedule_from_payload(payload: dict[str, Any]) -> ScheduledJob:
     name = str(payload.get("name") or "").strip()
     if not name:
@@ -154,6 +227,8 @@ def schedule_from_payload(payload: dict[str, Any]) -> ScheduledJob:
     job_type = str(payload.get("job_type") or "mdt_transfer")
     if job_type not in TYPE_LABELS:
         raise ValueError(f"Unsupported job type: {job_type}")
+
+    _reject_unsafe_commands(payload)
 
     session_id = payload.get("session_id") or None
     start_time = payload.get("start_time") or None
@@ -181,18 +256,25 @@ def schedule_from_payload(payload: dict[str, Any]) -> ScheduledJob:
                 for item in remote_bases.replace("\n", ";").split(";")
                 if item.strip()
             ]
+        site_mode = str(raw_mdt.get("site_mode") or "all").strip().lower()
+        sites = _parse_site_list(raw_mdt.get("sites")) if site_mode == "list" else []
         mdt = MdtTransferSettings(
             local_base=str(raw_mdt.get("local_base") or "").strip(),
             remote_bases=[str(item).rstrip("/") for item in remote_bases if str(item).strip()],
+            sites=sites,
             initial_lookback_minutes=int(raw_mdt.get("initial_lookback_minutes") or 90),
             grace_minutes=int(raw_mdt.get("grace_minutes") or 30),
             max_parallel_downloads=int(raw_mdt.get("max_parallel_downloads") or 2),
+            retry_attempts=max(1, int(raw_mdt.get("retry_attempts") or 5)),
+            retry_delay_seconds=max(0, int(raw_mdt.get("retry_delay_seconds") or 20)),
             dry_run=bool(raw_mdt.get("dry_run", True)),
         )
         if not mdt.local_base:
             raise ValueError("Select a local base folder.")
         if not mdt.remote_bases:
             raise ValueError("Add at least one remote CELLTRACE base.")
+        if site_mode == "list" and not mdt.sites:
+            raise ValueError("Add at least one site, or choose 'Collect all'.")
 
     return ScheduledJob(
         name=name,
@@ -230,32 +312,64 @@ def api_session_update(payload: dict[str, Any]) -> dict[str, Any]:
         session = sessions_by_id().get(session_id)
         if not session:
             raise KeyError("Session not found.")
+        new_name = str(payload.get("name") or "").strip()
+        if new_name and new_name != session.name:
+            if any(
+                other.id != session_id and other.name.lower() == new_name.lower()
+                for other in sessions
+            ):
+                raise ValueError(f"A session named '{new_name}' already exists.")
+            session.name = new_name
         session.host = str(payload.get("host") or "").strip()
         session.port = int(payload.get("port") or 22)
         session.username = str(payload.get("username") or "").strip()
-        if "password" in payload:
-            session.password = str(payload.get("password") or "")
+        if payload.get("clear_password"):
+            session.password = ""
+        else:
+            password = str(payload.get("password") or "")
+            if password:
+                session.password = password
         session.timeout = int(payload.get("timeout") or 30)
+        sessions.sort(key=lambda item: item.name.lower())
+        scheduler.set_sessions(sessions)
+        save_sessions()
+    return {"ok": True, "id": session.id}
+
+
+def api_add_session(payload: dict[str, Any]) -> dict[str, Any]:
+    global sessions
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("Enter a session name.")
+    with state_lock:
+        if any(item.id == name or item.name.lower() == name.lower() for item in sessions):
+            raise ValueError(f"A session named '{name}' already exists.")
+        session = EnmSession(
+            id=name,
+            name=name,
+            host=str(payload.get("host") or "").strip(),
+            port=int(payload.get("port") or 5023),
+            username=str(payload.get("username") or "").strip(),
+            timeout=int(payload.get("timeout") or 30),
+            password=str(payload.get("password") or ""),
+        )
+        sessions.append(session)
+        sessions.sort(key=lambda item: item.name.lower())
+        scheduler.set_sessions(sessions)
+        save_sessions()
+    return {"ok": True, "id": session.id}
+
+
+def api_delete_session(session_id: str) -> dict[str, Any]:
+    global sessions
+    with state_lock:
+        remaining = [item for item in sessions if item.id != session_id]
+        if len(remaining) == len(sessions):
+            raise KeyError("Session not found.")
+        sessions = remaining
         scheduler.set_sessions(sessions)
         save_sessions()
     return {"ok": True}
-
-
-def api_import_manager_sessions() -> dict[str, Any]:
-    global sessions
-    imported = load_manager_sessions()
-    if not imported:
-        raise FileNotFoundError("No ENM Manager sessions found.")
-    with state_lock:
-        current = sessions_by_id()
-        for session in imported:
-            old = current.get(session.id)
-            if old:
-                session.password = old.password
-        sessions = merge_sessions(imported, [])
-        scheduler.set_sessions(sessions)
-        save_sessions()
-    return {"ok": True, "count": len(imported)}
 
 
 def api_add_schedule(payload: dict[str, Any]) -> dict[str, Any]:
@@ -281,7 +395,10 @@ def api_start_schedule(schedule_id: str) -> dict[str, Any]:
 
 def api_stop_schedule(schedule_id: str) -> dict[str, Any]:
     scheduler.stop_schedule(schedule_id)
-    return {"ok": True}
+    return {
+        "ok": True,
+        "message": "Schedule stopped. Active run unchanged; use Stop run to cancel it.",
+    }
 
 
 def api_run_now(schedule_id: str) -> dict[str, Any]:
@@ -315,6 +432,76 @@ def api_progress(schedule_id: str) -> dict[str, Any]:
     }
 
 
+def api_preview(query: dict[str, list[str]]) -> dict[str, Any]:
+    job_type = (query.get("job_type") or ["mdt_transfer"])[0]
+    if job_type == "python_script":
+        raw_path = (query.get("path") or [""])[0].strip()
+        if not raw_path:
+            raise ValueError("Select a Python script first.")
+        path = Path(raw_path)
+        if not path.is_file():
+            raise ValueError("The selected script file does not exist.")
+        size = path.stat().st_size
+        content = path.read_bytes()[:MAX_PREVIEW_BYTES].decode("utf-8", errors="replace")
+        return {
+            "ok": True,
+            "title": path.name,
+            "path": str(path),
+            "content": content,
+            "truncated": size > MAX_PREVIEW_BYTES,
+        }
+    site_mode = (query.get("site_mode") or ["all"])[0].strip().lower()
+    sites = _parse_site_list((query.get("sites") or [""])[0]) if site_mode == "list" else []
+    if sites:
+        scope = (
+            f"Job scope: ONLY the {len(sites)} site(s) listed below.\n"
+            "All other folders discovered in the ENM will be ignored.\n"
+            + "".join(f"  - {name}\n" for name in sites)
+            + "\n"
+        )
+    else:
+        scope = (
+            "Job scope: ALL discovered sites ('Collect all' mode).\n"
+            "No site list is defined.\n\n"
+        )
+    source = COLLECTOR_SOURCE.read_text(encoding="utf-8")
+    return {
+        "ok": True,
+        "title": "MDT Transfer - enm_mdt_scheduler/collector.py",
+        "path": str(COLLECTOR_SOURCE),
+        "content": scope + MDT_PREVIEW_SUMMARY + source,
+        "truncated": False,
+    }
+
+
+def api_pick_folder(query: dict[str, list[str]]) -> dict[str, Any]:
+    initial = (query.get("initial") or [""])[0].strip()
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:  # pragma: no cover - headless host
+        raise RuntimeError(
+            "Native folder picker is not available on this host. Type the path manually."
+        ) from exc
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            chosen = filedialog.askdirectory(
+                initialdir=initial or str(Path.home()),
+                title="Select the MDT download folder",
+                mustexist=False,
+            )
+        finally:
+            root.destroy()
+    except Exception as exc:  # pragma: no cover - no interactive desktop
+        raise RuntimeError(
+            "Could not open the folder picker on this host. Type the path manually."
+        ) from exc
+    return {"ok": True, "path": chosen or ""}
+
+
 def render_index() -> str:
     default_local = html.escape(str(APP_DIR / "MDT_Downloads"), quote=True)
     return INDEX_HTML.replace("{{ default_local }}", default_local)
@@ -334,9 +521,24 @@ class SchedulerHttpHandler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self._send_json(api_state())
             return
+        if path == "/api/preview":
+            query = parse_qs(urlparse(self.path).query)
+            self._handle_json(lambda: api_preview(query))
+            return
+        if path == "/api/pick-folder":
+            query = parse_qs(urlparse(self.path).query)
+            self._handle_json(lambda: api_pick_folder(query))
+            return
         if path.startswith("/api/schedules/") and path.endswith("/progress"):
             schedule_id = path.split("/")[3]
             self._handle_json(lambda: api_progress(schedule_id))
+            return
+        if path == "/static/amdocs_logo.png":
+            if LOGO_PATH.is_file():
+                self._send_bytes(LOGO_PATH.read_bytes(), "image/png")
+            else:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
             return
         if path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
@@ -350,8 +552,8 @@ class SchedulerHttpHandler(BaseHTTPRequestHandler):
         if path == "/api/session":
             self._handle_json(lambda: api_session_update(payload))
             return
-        if path == "/api/import-manager-sessions":
-            self._handle_json(api_import_manager_sessions)
+        if path == "/api/sessions":
+            self._handle_json(lambda: api_add_session(payload))
             return
         if path == "/api/schedules":
             self._handle_json(lambda: api_add_schedule(payload))
@@ -389,6 +591,11 @@ class SchedulerHttpHandler(BaseHTTPRequestHandler):
             if len(parts) == 3:
                 self._handle_json(lambda: api_delete_schedule(parts[2]))
                 return
+        if path.startswith("/api/sessions/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 3:
+                self._handle_json(lambda: api_delete_session(unquote(parts[2])))
+                return
         self._send_json({"ok": False, "error": "Not found"}, HTTPStatus.NOT_FOUND)
 
     def _read_json(self) -> dict[str, Any]:
@@ -421,6 +628,14 @@ class SchedulerHttpHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_bytes(self, body: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "max-age=86400")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -475,6 +690,8 @@ INDEX_HTML = r"""
       max-width: 97vw;
       max-height: 92vh;
       width: 1140px;
+      display: flex;
+      flex-direction: column;
     }
     .enm-modal-header {
       background: var(--modal-head);
@@ -483,6 +700,15 @@ INDEX_HTML = r"""
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-logo {
+      height: 22px;
+      width: auto;
+      display: block;
+      border-right: 1px solid var(--line);
+      padding-right: 12px;
     }
     .enm-modal-title {
       font-size: 14px;
@@ -495,7 +721,29 @@ INDEX_HTML = r"""
       line-height: 1;
       font-weight: 200;
     }
-    .modal-body { padding: 12px 16px 14px; }
+    .modal-body { padding: 12px 16px 14px; overflow-y: auto; min-height: 0; flex: 1 1 auto; }
+    .tab-bar {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 14px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--muted, #8fa3bf);
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border-radius: 0;
+    }
+    .tab-btn:hover { color: var(--link); }
+    .tab-btn.active {
+      color: var(--link);
+      border-bottom-color: var(--link);
+    }
     .enm-section {
       background: var(--card);
       border: 1px solid var(--line);
@@ -629,17 +877,28 @@ INDEX_HTML = r"""
 <main>
   <section class="enm-modal-dark">
     <div class="enm-modal-header">
-      <span class="enm-modal-title">Script Scheduler</span>
+      <div class="brand">
+        <img class="brand-logo" src="/static/amdocs_logo.png" alt="Amdocs">
+        <span class="enm-modal-title">ENM Script Scheduler</span>
+      </div>
       <span class="modal-x">x</span>
     </div>
     <div class="modal-body">
+      <div class="tab-bar">
+        <button id="tabCreateBtn" type="button" class="tab-btn active" onclick="switchTab('create')">Create scheduler</button>
+        <button id="tabSessionsBtn" type="button" class="tab-btn" onclick="switchTab('sessions')">Manage sessions</button>
+      </div>
+
+      <div id="tabSessions" class="tab-pane hidden">
       <div class="enm-section">
         <div class="enm-section-title">ENM Sessions</div>
         <div class="row">
           <label>Session</label>
           <select id="sessionSelect" class="medium"></select>
+          <label>Name</label>
+          <input id="sessionName" class="medium" placeholder="ENMBARB">
           <label>Host</label>
-          <input id="sessionHost" class="medium">
+          <input id="sessionHost" class="medium" placeholder="10.x.x.x">
           <label>Port</label>
           <input id="sessionPort" class="short" type="number">
           <label>User</label>
@@ -648,12 +907,15 @@ INDEX_HTML = r"""
           <input id="sessionPassword" class="medium" type="password" autocomplete="current-password">
           <label>Timeout</label>
           <input id="sessionTimeout" class="short" type="number">
-          <button onclick="saveSession()">Apply</button>
-          <button onclick="importSessions()">Import Manager Sessions</button>
+          <button class="enm-btn-primary" onclick="saveSession()">Save changes</button>
+          <button onclick="addSession()">Add new</button>
+          <button class="enm-btn-danger" onclick="removeSession()">Remove</button>
           <span id="sessionMsg" class="note"></span>
         </div>
       </div>
+      </div>
 
+      <div id="tabCreate" class="tab-pane">
       <div id="scheduleRows" class="schedule-list"></div>
       <div id="jobMsg" class="note" style="margin-bottom:10px;"></div>
 
@@ -685,13 +947,30 @@ INDEX_HTML = r"""
 
           <div id="mdtFields" class="full">
             <div class="row">
-              <label>Local base</label>
+              <label>Download folder</label>
               <input id="localBase" class="long" value="{{ default_local }}">
+              <button type="button" onclick="pickFolder()">Browse...</button>
+              <span class="note">files saved as: folder/DDMMYYYY/&lt;site&gt;/</span>
             </div>
             <div class="row" style="margin-top:8px">
               <label>Remote bases</label>
               <input id="remoteBases" class="long" value="/ericsson/pmic1/CELLTRACE;/ericsson/pmic2/CELLTRACE">
             </div>
+            <div class="row" style="margin-top:8px">
+              <label>Sites</label>
+              <select id="siteMode" class="medium" onchange="siteModeChanged()">
+                <option value="all">Collect all (auto-discover)</option>
+                <option value="list">From site list</option>
+              </select>
+              <button type="button" id="loadSitesBtn" class="hidden" onclick="document.getElementById('sitesFile').click()">Load .txt</button>
+              <input type="file" id="sitesFile" accept=".txt,.csv" class="hidden" onchange="onSitesFile(event)">
+              <span id="sitesCount" class="note"></span>
+            </div>
+            <div id="sitesRow" class="row hidden" style="margin-top:6px">
+              <label>Site list</label>
+              <input id="sites" class="long" placeholder="MAAP2_MG, MASC2_MG, ... (comma, semicolon or one site per line)" oninput="updateSitesCount()">
+            </div>
+
             <div class="row" style="margin-top:8px">
               <label>First lookback min</label>
               <input id="lookback" class="short" type="number" value="90">
@@ -699,8 +978,23 @@ INDEX_HTML = r"""
               <input id="grace" class="short" type="number" value="30">
               <label>Parallel</label>
               <input id="parallel" class="short" type="number" value="2">
+              <label>Retries</label>
+              <input id="retryAttempts" class="short" type="number" min="1" value="5">
+              <label>Retry delay sec</label>
+              <input id="retryDelay" class="short" type="number" min="0" value="20">
               <label><input id="dryRun" type="checkbox" checked> Dry run (scan only)</label>
             </div>
+          </div>
+
+          <div class="full" style="margin-top:6px">
+            <div class="row" style="justify-content:space-between;">
+              <div class="row">
+                <button type="button" id="previewBtn" onclick="previewCode()">Preview code</button>
+                <button type="button" id="previewHideBtn" class="hidden" onclick="hidePreview()">Hide</button>
+              </div>
+              <span id="previewMsg" class="note"></span>
+            </div>
+            <pre id="previewBox" class="hidden"></pre>
           </div>
 
           <div class="full row" style="margin-top:4px">
@@ -711,15 +1005,15 @@ INDEX_HTML = r"""
             <input id="testSeconds" class="short" type="number" value="0">
             <label><input id="timeWindow" type="checkbox" onchange="windowChanged()"> Time window</label>
             <span>From</span>
-            <input id="startDate" class="medium" value="">
-            <input id="startHour" class="short" type="number" min="0" max="23">
+            <input id="startDate" class="medium" type="date">
+            <input id="startHour" class="short" type="number" min="0" max="23" title="hour (0-23)">
             <span>:</span>
-            <input id="startMinute" class="short" type="number" min="0" max="59">
+            <input id="startMinute" class="short" type="number" min="0" max="59" title="minute (0-59)">
             <span>To</span>
-            <input id="endDate" class="medium" value="">
-            <input id="endHour" class="short" type="number" min="0" max="23">
+            <input id="endDate" class="medium" type="date">
+            <input id="endHour" class="short" type="number" min="0" max="23" title="hour (0-23)">
             <span>:</span>
-            <input id="endMinute" class="short" type="number" min="0" max="59">
+            <input id="endMinute" class="short" type="number" min="0" max="59" title="minute (0-59)">
             <label><input id="enabled" type="checkbox"> Start immediately</label>
           </div>
 
@@ -729,6 +1023,7 @@ INDEX_HTML = r"""
             <span id="formMsg" class="note"></span>
           </div>
         </div>
+      </div>
       </div>
     </div>
   </section>
@@ -753,15 +1048,19 @@ function pad2(value) {
   return String(value).padStart(2, '0');
 }
 
+function localDate(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
 function initDates() {
   const now = new Date();
   const later = new Date(now.getTime() + 60 * 60 * 1000);
-  $('startDate').value = now.toISOString().slice(0, 10);
-  $('endDate').value = later.toISOString().slice(0, 10);
-  $('startHour').value = pad2(now.getHours());
-  $('startMinute').value = pad2(now.getMinutes());
-  $('endHour').value = pad2(later.getHours());
-  $('endMinute').value = pad2(later.getMinutes());
+  $('startDate').value = localDate(now);
+  $('endDate').value = localDate(later);
+  $('startHour').value = now.getHours();
+  $('startMinute').value = now.getMinutes();
+  $('endHour').value = later.getHours();
+  $('endMinute').value = later.getMinutes();
   windowChanged();
 }
 
@@ -810,6 +1109,7 @@ function renderSessions() {
 function fillSessionForm() {
   const session = state.sessions.find(item => item.id === $('sessionSelect').value);
   if (!session) return;
+  $('sessionName').value = session.name || '';
   $('sessionHost').value = session.host || '';
   $('sessionPort').value = session.port || 22;
   $('sessionUser').value = session.username || '';
@@ -853,7 +1153,7 @@ function renderSchedules() {
         <button onclick="showProgressFor('${escapeAttr(schedule.id)}')">Progress</button>
         ${running ? `<button class="enm-btn-danger" onclick="scheduleActionFor('${escapeAttr(schedule.id)}','stop-run')">Stop run</button>` : ''}
         ${schedule.enabled
-          ? `<button onclick="scheduleActionFor('${escapeAttr(schedule.id)}','stop')">Stop</button>`
+          ? `<button onclick="scheduleActionFor('${escapeAttr(schedule.id)}','stop')">Stop schedule</button>`
           : `<button class="enm-btn-primary" onclick="scheduleActionFor('${escapeAttr(schedule.id)}','start')">Start</button>`}
         <button onclick="scheduleActionFor('${escapeAttr(schedule.id)}','run-now')">Run Now</button>
         <button onclick="editSchedule('${escapeAttr(schedule.id)}')">Edit</button>
@@ -868,11 +1168,16 @@ function renderSchedules() {
 }
 
 async function saveSession() {
+  const id = $('sessionSelect').value;
+  if (!id) return setMsg('sessionMsg', 'Select a session first, or use "Add new".', true);
+  const name = ($('sessionName').value || '').trim();
+  if (!name) return setMsg('sessionMsg', 'Enter a session name.', true);
   try {
     await api('/api/session', {
       method: 'POST',
       body: JSON.stringify({
-        id: $('sessionSelect').value,
+        id,
+        name,
         host: $('sessionHost').value,
         port: Number($('sessionPort').value || 22),
         username: $('sessionUser').value,
@@ -880,17 +1185,50 @@ async function saveSession() {
         timeout: Number($('sessionTimeout').value || 30)
       })
     });
-    setMsg('sessionMsg', 'Session updated. Password stays only in memory.');
+    setMsg('sessionMsg', 'Session saved. Password is encrypted for this Windows user.');
+    renderedSessionId = null;
     await refreshState();
+    $('sessionSelect').value = id;
+    fillSessionForm();
   } catch (err) {
     setMsg('sessionMsg', err.message, true);
   }
 }
 
-async function importSessions() {
+async function addSession() {
+  const name = ($('sessionName').value || '').trim();
+  if (!name) return setMsg('sessionMsg', 'Enter a session name to add.', true);
   try {
-    const result = await api('/api/import-manager-sessions', {method: 'POST'});
-    setMsg('sessionMsg', `Imported ${result.count} session(s).`);
+    const result = await api('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        host: $('sessionHost').value,
+        port: Number($('sessionPort').value || 5023),
+        username: $('sessionUser').value,
+        password: $('sessionPassword').value,
+        timeout: Number($('sessionTimeout').value || 30)
+      })
+    });
+    setMsg('sessionMsg', `Session '${name}' added. Password is encrypted for this Windows user.`);
+    renderedSessionId = null;
+    await refreshState();
+    $('sessionSelect').value = result.id || name;
+    fillSessionForm();
+  } catch (err) {
+    setMsg('sessionMsg', err.message, true);
+  }
+}
+
+async function removeSession() {
+  const id = $('sessionSelect').value;
+  if (!id) return setMsg('sessionMsg', 'Select a session first.', true);
+  const session = state.sessions.find(item => item.id === id);
+  if (!confirm(`Remove session '${session?.name || id}'?`)) return;
+  try {
+    await api(`/api/sessions/${encodeURIComponent(id)}`, {method: 'DELETE'});
+    setMsg('sessionMsg', 'Session removed.');
+    renderedSessionId = null;
     await refreshState();
   } catch (err) {
     setMsg('sessionMsg', err.message, true);
@@ -956,9 +1294,15 @@ function editSchedule(scheduleId) {
   $('enabled').checked = !!schedule.enabled;
   $('localBase').value = schedule.mdt?.local_base || '';
   $('remoteBases').value = (schedule.mdt?.remote_bases || []).join(';');
+  const mdtSites = schedule.mdt?.sites || [];
+  $('siteMode').value = mdtSites.length ? 'list' : 'all';
+  $('sites').value = mdtSites.join(';');
+  siteModeChanged();
   $('lookback').value = schedule.mdt?.initial_lookback_minutes || 90;
   $('grace').value = schedule.mdt?.grace_minutes || 30;
   $('parallel').value = schedule.mdt?.max_parallel_downloads || 2;
+  $('retryAttempts').value = schedule.mdt?.retry_attempts || 5;
+  $('retryDelay').value = schedule.mdt?.retry_delay_seconds || 20;
   $('dryRun').checked = !!schedule.mdt?.dry_run;
   $('timeWindow').checked = !!(schedule.start_time && schedule.end_time);
   if (schedule.start_time) setDateParts('start', schedule.start_time);
@@ -980,8 +1324,8 @@ function setDateParts(prefix, value) {
   const [date, time] = value.replace('T', ' ').split(' ');
   const [hour, minute] = (time || '00:00').split(':');
   $(`${prefix}Date`).value = date;
-  $(`${prefix}Hour`).value = hour;
-  $(`${prefix}Minute`).value = minute;
+  $(`${prefix}Hour`).value = Number(hour);
+  $(`${prefix}Minute`).value = Number(minute);
 }
 
 function collectPayload() {
@@ -999,9 +1343,13 @@ function collectPayload() {
     mdt: {
       local_base: $('localBase').value,
       remote_bases: $('remoteBases').value,
+      site_mode: $('siteMode').value,
+      sites: $('siteMode').value === 'list' ? $('sites').value : '',
       initial_lookback_minutes: Number($('lookback').value || 90),
       grace_minutes: Number($('grace').value || 30),
       max_parallel_downloads: Number($('parallel').value || 2),
+      retry_attempts: Number($('retryAttempts').value || 5),
+      retry_delay_seconds: Number($('retryDelay').value || 20),
       dry_run: $('dryRun').checked
     }
   };
@@ -1054,10 +1402,84 @@ async function refreshProgress() {
   }
 }
 
+function siteModeChanged() {
+  const isList = $('siteMode').value === 'list';
+  $('sitesRow').classList.toggle('hidden', !isList);
+  $('loadSitesBtn').classList.toggle('hidden', !isList);
+  updateSitesCount();
+}
+
+function updateSitesCount() {
+  const raw = ($('sites').value || '').split(/[;,\r\n]+/).map(s => s.trim()).filter(Boolean);
+  $('sitesCount').textContent = $('siteMode').value === 'list' ? `${raw.length} site(s)` : '';
+}
+
+function onSitesFile(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const names = String(reader.result || '').split(/[\r\n;,]+/).map(s => s.trim()).filter(Boolean);
+    $('sites').value = names.join(';');
+    updateSitesCount();
+    setMsg('formMsg', `Loaded ${names.length} site(s) from ${file.name}.`);
+  };
+  reader.readAsText(file);
+  event.target.value = '';
+}
+
 function typeChanged() {
   const isMdt = $('jobType').value === 'mdt_transfer';
   $('mdtFields').classList.toggle('hidden', !isMdt);
   $('scriptFields').classList.toggle('hidden', isMdt);
+  $('previewBtn').textContent = isMdt ? 'Preview MDT logic' : 'Preview script';
+  hidePreview();
+}
+
+async function pickFolder() {
+  setMsg('formMsg', 'Opening folder picker on this machine...');
+  try {
+    const data = await api('/api/pick-folder?initial=' + encodeURIComponent($('localBase').value || ''));
+    if (data.path) {
+      $('localBase').value = data.path;
+      setMsg('formMsg', 'Download folder selected.');
+    } else {
+      setMsg('formMsg', 'No folder selected.');
+    }
+  } catch (err) {
+    setMsg('formMsg', 'Browse unavailable: ' + err.message, true);
+  }
+}
+
+async function previewCode() {
+  const jobType = $('jobType').value;
+  const params = new URLSearchParams({job_type: jobType});
+  if (jobType === 'python_script') {
+    const scriptPath = ($('scriptPath').value || '').trim();
+    if (!scriptPath) return setMsg('previewMsg', 'Select a Python script first.', true);
+    params.set('path', scriptPath);
+  } else {
+    params.set('site_mode', $('siteMode').value);
+    if ($('siteMode').value === 'list') params.set('sites', $('sites').value || '');
+  }
+  setMsg('previewMsg', 'Loading...');
+  try {
+    const data = await api('/api/preview?' + params.toString());
+    const box = $('previewBox');
+    box.textContent = (data.content || '') + (data.truncated ? '\n\n... (truncated preview) ...' : '');
+    box.classList.remove('hidden');
+    $('previewHideBtn').classList.remove('hidden');
+    setMsg('previewMsg', data.title || 'Preview');
+  } catch (err) {
+    setMsg('previewMsg', err.message, true);
+  }
+}
+
+function hidePreview() {
+  $('previewBox').classList.add('hidden');
+  $('previewBox').textContent = '';
+  $('previewHideBtn').classList.add('hidden');
+  setMsg('previewMsg', '');
 }
 
 function windowChanged() {
@@ -1075,12 +1497,22 @@ function escapeHtml(value) {
 
 function escapeAttr(value) { return escapeHtml(value).replace(/"/g, '&quot;'); }
 
+function switchTab(tab) {
+  const isSessions = tab === 'sessions';
+  $('tabSessions').classList.toggle('hidden', !isSessions);
+  $('tabCreate').classList.toggle('hidden', isSessions);
+  $('tabSessionsBtn').classList.toggle('active', isSessions);
+  $('tabCreateBtn').classList.toggle('active', !isSessions);
+}
+
 $('sessionSelect').addEventListener('change', () => {
   renderedSessionId = null;
   fillSessionForm();
 });
+switchTab('create');
 initDates();
 typeChanged();
+siteModeChanged();
 refreshState();
 setInterval(refreshState, 2000);
 </script>

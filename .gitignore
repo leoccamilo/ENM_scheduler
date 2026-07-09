@@ -1,18 +1,22 @@
 # Runtime/local configuration
 config.json
 schedules.json
+.enm_credentials.json
+sites.txt
 MDT_Downloads/
+MDT_Download/
 *.log
 
 # Python caches
 __pycache__/
 *.py[cod]
 
-# Ambiente virtual local do projeto
+# Local project virtual environment
 .venv/
 
-# Snapshots/artefatos zipados
+# Snapshots/zipped artifacts
 *.zip
+scheduler/
 
 # Local/legacy material with hardcoded credentials and operational site lists
 TransferMDT/
