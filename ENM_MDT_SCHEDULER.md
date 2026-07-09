@@ -48,13 +48,17 @@ download timestamp. This is what prevents repeated downloads.
 ## Run
 
 ```powershell
-C:\CRT\.venv\Scripts\python.exe app.py
+cd C:\ENM_Scheduler
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
 Open `http://127.0.0.1:8095`.
 
-Use the Python 3.9 virtual environment from ENM Manager. This keeps scheduled
-Python scripts on the same runtime expected by ENM scripting.
+Use the project-local Python 3.9 virtual environment. The dependency versions in
+`requirements.txt` are pinned for corporate Windows VMs where newer
+`cryptography` wheels may fail to load their native Rust module.
 
 ENM sessions are self-contained in `config.json` and fully managed in the
 **Manage sessions** tab: add, edit (name, host/IP, port, user, password,

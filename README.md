@@ -23,16 +23,30 @@ avoid duplicate downloads. MDT files are saved under
 `<Download folder>/DDMMYYYY/<site>/`. This date/site sub-foldering is specific to
 MDT jobs; other job types write directly to the selected folder.
 
-Run:
+Install dependencies and run:
 
 ```powershell
-C:\CRT\.venv\Scripts\python.exe app.py
+cd C:\ENM_Scheduler
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
 Or use:
 
 ```powershell
 .\run_scheduler.bat
+```
+
+On corporate Windows VMs, use the project-local `.venv`. The dependency
+versions are pinned because newer `cryptography` wheels can fail to load their
+native Rust module on older Windows images. To repair a broken install:
+
+```powershell
+cd C:\ENM_Scheduler
+.\.venv\Scripts\python.exe -m pip uninstall -y paramiko cryptography bcrypt pynacl cffi pycparser
+.\.venv\Scripts\python.exe -m pip install --no-cache-dir --force-reinstall -r requirements.txt
+.\.venv\Scripts\python.exe -c "import paramiko; print(paramiko.__version__)"
 ```
 
 Open:
