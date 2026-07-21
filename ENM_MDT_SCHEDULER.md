@@ -38,8 +38,10 @@ download timestamp. This is what prevents repeated downloads.
 
 ## Scan Rules
 
-- First run: downloads files modified within the configured lookback window
-  (`90` minutes by default).
+- New schedules default to **From site list**; **Collect all** remains available
+  when explicitly selected.
+- First successful run: downloads every matching file still available in ENM
+  for the selected sites, regardless of file age.
 - Later runs: scans from the previous run minus a grace window (`30` minutes by
   default), then skips anything already recorded in state.
 - Remote bases stay limited to CELLTRACE:
@@ -114,6 +116,8 @@ job types.
 Use `Dry run (scan only)` while validating the schedule. In this mode the app
 connects, scans CELLTRACE and reports what it would download, but it does not
 transfer files and does not update `_state/downloaded_files.json`.
+`Dry run` is unchecked by default for new schedules and must be enabled
+explicitly for this validation mode.
 
 Use `Test sec` to run the scheduler in seconds during validation. When
 `Test sec` is greater than `0`, it overrides `Every min`. For the real hourly
