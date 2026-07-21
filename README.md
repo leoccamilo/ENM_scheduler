@@ -23,6 +23,11 @@ avoid duplicate downloads. MDT files are saved under
 `<Download folder>/DDMMYYYY/<site>/`. This date/site sub-foldering is specific to
 MDT jobs; other job types write directly to the selected folder.
 
+For a new schedule, **From site list** is the default scope. Its first successful
+collection downloads every matching MDT file still available in ENM for those
+sites. Later collections are incremental and revisit the configured grace
+window before the previous checkpoint, without duplicating known files.
+
 Install dependencies and run:
 
 ```powershell
@@ -62,7 +67,9 @@ space:
 
 - **Create scheduler**: job list, progress logs and the "Add New Schedule" form
   (job type, session, MDT settings, download folder with a native `Browse...`
-  picker, site scope, time window with a 24h date/hour/minute picker).
+  picker, site scope, time window with a 24h date/hour/minute picker). Labels
+  with a dotted underline provide contextual help when the pointer rests on
+  them.
 - **Manage sessions**: the ENM Sessions panel where you can add, edit (name,
   host/IP, port, user, password, timeout) and remove connections. Sessions are
   self-contained in `config.json`; the connection `id` stays stable when you
@@ -74,7 +81,8 @@ The header shows the Amdocs logo.
 
 For scheduler testing, enable `Dry run (scan only)` and set `Test sec` to a
 small value such as `30`. For production scheduling, leave `Test sec` as `0`
-and use `Every min` with the desired interval.
+and use `Every min` with the desired interval. `Dry run` is disabled by default
+for new schedules.
 
 `Stop schedule` disables future cycles only. `Stop run` requests cancellation of
 the active MDT Transfer run and closes active SFTP connections when possible.

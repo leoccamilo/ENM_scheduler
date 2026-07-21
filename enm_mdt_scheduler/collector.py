@@ -455,11 +455,12 @@ class EnmMdtCollector:
                 f"{datetime.fromtimestamp(min_mtime).strftime('%Y-%m-%d %H:%M:%S')}"
             )
         else:
-            min_mtime = scan_started - self.config.initial_lookback_minutes * 60
-            self._emit(
-                "[state] First scan: looking back "
-                f"{self.config.initial_lookback_minutes} minute(s)"
-            )
+            # ENM keeps CELLTRACE/MDT logs only for a limited time. On a job's
+            # first successful collection, take everything still available so
+            # an arbitrary lookback window cannot discard logs before the
+            # scheduler has had a chance to preserve them locally.
+            min_mtime = 0.0
+            self._emit("[state] First scan: collecting all available files")
 
         files = self.scan(min_mtime=min_mtime)
         self._raise_if_cancelled()

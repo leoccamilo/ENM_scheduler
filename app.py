@@ -37,9 +37,9 @@ MDT_PREVIEW_SUMMARY = (
     "     - 'Collect all': processes every discovered site.\n"
     "     - 'From site list': processes only the sites registered in this job\n"
     "       (case-insensitive site-name comparison).\n"
-    "  3. Selects only *.bin.gz and *.gpb.gz files modified inside the scan\n"
-    "     window (first cycle = 'First lookback min'; later cycles = since the\n"
-    "     previous scan minus 'Grace min').\n"
+    "  3. Selects only *.bin.gz and *.gpb.gz files. The first successful cycle\n"
+    "     collects every file still available; later cycles scan from the\n"
+    "     previous checkpoint minus 'Grace min'.\n"
     "  4. Skips files already downloaded according to _state/downloaded_files.json.\n"
     "  5. Downloads new files to <Local base>/DDMMYYYY/<site>/.\n"
     "     In 'Dry run', it only lists what it would download and does not\n"
@@ -762,6 +762,11 @@ INDEX_HTML = r"""
       font-size: 12px;
       white-space: nowrap;
     }
+    .help-label {
+      cursor: help;
+      text-decoration: underline dotted;
+      text-underline-offset: 3px;
+    }
     input, select, button {
       font: inherit;
       border-radius: 3px;
@@ -932,12 +937,12 @@ INDEX_HTML = r"""
         <div class="grid">
           <label>Name</label>
           <input id="name" class="grow" placeholder="MDT BARB hourly">
-          <label>Type</label>
+          <label class="help-label" title="MDT Transfer uses the built-in ENM collector; Script runs a selected local Python file.">Type</label>
           <select id="jobType" class="medium" onchange="typeChanged()">
             <option value="mdt_transfer">MDT Transfer</option>
             <option value="python_script">Script (.py)</option>
           </select>
-          <label>Session</label>
+          <label class="help-label" title="ENM connection used by this schedule. Connections are configured in Manage sessions.">Session</label>
           <select id="jobSession" class="medium"></select>
 
           <div id="scriptFields" class="full hidden row">
@@ -947,49 +952,50 @@ INDEX_HTML = r"""
 
           <div id="mdtFields" class="full">
             <div class="row">
-              <label>Download folder</label>
-              <input id="localBase" class="long" value="{{ default_local }}">
+              <label class="help-label" title="Local folder where MDT files are saved, organized as DDMMYYYY/site.">Download folder</label>
+              <input id="localBase" class="long" value="{{ default_local }}" title="Destination folder for downloaded MDT files.">
               <button type="button" onclick="pickFolder()">Browse...</button>
               <span class="note">files saved as: folder/DDMMYYYY/&lt;site&gt;/</span>
             </div>
             <div class="row" style="margin-top:8px">
-              <label>Remote bases</label>
-              <input id="remoteBases" class="long" value="/ericsson/pmic1/CELLTRACE;/ericsson/pmic2/CELLTRACE">
+              <label class="help-label" title="CELLTRACE directories searched in the ENM. Separate multiple paths with semicolons.">Remote bases</label>
+              <input id="remoteBases" class="long" value="/ericsson/pmic1/CELLTRACE;/ericsson/pmic2/CELLTRACE" title="Remote ENM directories searched for MDT files.">
             </div>
             <div class="row" style="margin-top:8px">
-              <label>Sites</label>
+              <label class="help-label" title="Choose whether to collect every discovered ENM site or only the sites entered in Site list.">Sites</label>
               <select id="siteMode" class="medium" onchange="siteModeChanged()">
                 <option value="all">Collect all (auto-discover)</option>
-                <option value="list">From site list</option>
+                <option value="list" selected>From site list</option>
               </select>
               <button type="button" id="loadSitesBtn" class="hidden" onclick="document.getElementById('sitesFile').click()">Load .txt</button>
               <input type="file" id="sitesFile" accept=".txt,.csv" class="hidden" onchange="onSitesFile(event)">
               <span id="sitesCount" class="note"></span>
             </div>
             <div id="sitesRow" class="row hidden" style="margin-top:6px">
-              <label>Site list</label>
+              <label class="help-label" title="Sites to collect. Names are matched without distinguishing uppercase and lowercase.">Site list</label>
               <input id="sites" class="long" placeholder="MAAP2_MG, MASC2_MG, ... (comma, semicolon or one site per line)" oninput="updateSitesCount()">
             </div>
 
             <div class="row" style="margin-top:8px">
-              <label>First lookback min</label>
-              <input id="lookback" class="short" type="number" value="90">
-              <label>Grace min</label>
-              <input id="grace" class="short" type="number" value="30">
-              <label>Parallel</label>
-              <input id="parallel" class="short" type="number" value="2">
-              <label>Retries</label>
-              <input id="retryAttempts" class="short" type="number" min="1" value="5">
-              <label>Retry delay sec</label>
-              <input id="retryDelay" class="short" type="number" min="0" value="20">
-              <label><input id="dryRun" type="checkbox" checked> Dry run (scan only)</label>
+              <input id="lookback" type="hidden" value="90">
+              <label class="help-label" title="On the first successful collection, the job downloads every MDT file still available in the ENM for the selected sites.">Initial scan</label>
+              <span class="note" title="The first collection is not limited by file age.">All available</span>
+              <label class="help-label" title="Safety overlap: each later scan starts this many minutes before the previous checkpoint. Already downloaded files are not duplicated.">Grace min</label>
+              <input id="grace" class="short" type="number" value="30" title="Minutes revisited before the previous scan checkpoint.">
+              <label class="help-label" title="Maximum number of MDT files downloaded simultaneously. Higher values use more ENM, network and disk resources.">Parallel</label>
+              <input id="parallel" class="short" type="number" value="2" title="Maximum simultaneous downloads.">
+              <label class="help-label" title="Maximum connection/download attempts after a temporary failure.">Retries</label>
+              <input id="retryAttempts" class="short" type="number" min="1" value="5" title="Number of attempts for temporary failures.">
+              <label class="help-label" title="Time in seconds to wait between retry attempts.">Retry delay sec</label>
+              <input id="retryDelay" class="short" type="number" min="0" value="20" title="Seconds between retry attempts.">
+              <label class="help-label" title="Scans and lists candidate files without downloading them or saving the collection checkpoint."><input id="dryRun" type="checkbox"> Dry run (scan only)</label>
             </div>
           </div>
 
           <div class="full" style="margin-top:6px">
             <div class="row" style="justify-content:space-between;">
               <div class="row">
-                <button type="button" id="previewBtn" onclick="previewCode()">Preview code</button>
+                <button type="button" id="previewBtn" onclick="previewCode()" title="Shows the collection logic used by this job.">Preview code</button>
                 <button type="button" id="previewHideBtn" class="hidden" onclick="hidePreview()">Hide</button>
               </div>
               <span id="previewMsg" class="note"></span>
@@ -998,12 +1004,12 @@ INDEX_HTML = r"""
           </div>
 
           <div class="full row" style="margin-top:4px">
-            <label>Run every</label>
-            <input id="interval" class="short" type="number" value="60">
+            <label class="help-label" title="Normal interval, in minutes, between scheduled collection cycles.">Run every</label>
+            <input id="interval" class="short" type="number" value="60" title="Minutes between normal runs.">
             <span>min</span>
-            <label>Test sec</label>
-            <input id="testSeconds" class="short" type="number" value="0">
-            <label><input id="timeWindow" type="checkbox" onchange="windowChanged()"> Time window</label>
+            <label class="help-label" title="Optional short interval for testing. Keep 0 in production to use Run every.">Test sec</label>
+            <input id="testSeconds" class="short" type="number" value="0" title="Test interval in seconds; 0 disables test mode.">
+            <label class="help-label" title="Restricts executions to the period between From and To."><input id="timeWindow" type="checkbox" onchange="windowChanged()"> Time window</label>
             <span>From</span>
             <input id="startDate" class="medium" type="date">
             <input id="startHour" class="short" type="number" min="0" max="23" title="hour (0-23)">
@@ -1014,7 +1020,7 @@ INDEX_HTML = r"""
             <input id="endHour" class="short" type="number" min="0" max="23" title="hour (0-23)">
             <span>:</span>
             <input id="endMinute" class="short" type="number" min="0" max="59" title="minute (0-59)">
-            <label><input id="enabled" type="checkbox"> Start immediately</label>
+            <label class="help-label" title="Enables the schedule as soon as it is created. If unchecked, it is saved stopped."><input id="enabled" type="checkbox"> Start immediately</label>
           </div>
 
           <div class="full row">
